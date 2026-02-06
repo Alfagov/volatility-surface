@@ -1,0 +1,9 @@
+[project]
+name = "volatility-surface"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "ipykernel>=7.1.0",
+    "pandas-stubs~=3.0.0",
+]
