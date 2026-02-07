@@ -23,14 +23,15 @@ class OptionsDataset(Dataset):
         return x, y
 
 class OptionsDataModule(pl.LightningDataModule):
-    def __init__(self, folder, batch_size = 64):
+    def __init__(self, folder, sofr_path = None, batch_size = 64):
         super().__init__()
         self.folder = folder
+        self.sofr_path = sofr_path
         self.train = None
         self.test = None
         self.val = None
         self.batch_size = batch_size
-        self.scaler = MinMaxScaler()
+        self.x_scaler = MinMaxScaler()
         self.y_scaler = MinMaxScaler()
 
     def setup(self, stage: str) -> None:
@@ -43,44 +44,56 @@ class OptionsDataModule(pl.LightningDataModule):
             df_list.append(df)
 
         final_df = pd.concat(df_list, ignore_index=True)
-        final_df = final_df[final_df["Price"] > 20]
-        final_df = final_df[final_df["T"] > 30]
-        final_df = final_df[final_df["T"] < 366]
-        X = final_df.loc[:, ["S", "K", "T", "vix"]]
+        final_df["date"] = pd.to_datetime(final_df["date"])
+        final_df = final_df.sort_values("date")
+
+        if self.sofr_path is not None:
+            sofr_df = pd.read_csv(self.sofr_path)
+            sofr_df["date"] = pd.to_datetime(sofr_df["date"])
+            sofr_df["sofr"] = sofr_df["sofr"] / 100.0
+            final_df = pd.merge(final_df, sofr_df, on="date", how="inner")
+
+        final_df["Price"] = final_df["Price"] / final_df["K"]
+
+        X = final_df.loc[:, ["S", "K", "T", "vix", 'hv_10', 'hv_14', 'hv_30', 'hv_60', 'hv_91', 'sofr']]
         Y = final_df.loc[:, "Price"]
 
-        X_train, X_test, Y_train, Y_test = train_test_split(X, Y, train_size=0.9, random_state=42, shuffle=True)
+        train_size = int(len(X) * 0.8)
+        val_size = int(len(X) * 0.1)
 
-        t_v_transf = self.scaler.fit_transform(X_train.loc[:, ["T", "vix"]])
-        X_train["T"] = t_v_transf[:, 0]
-        X_train["vix"] = t_v_transf[:, 1]
+        X_train = X.iloc[:train_size]
+        Y_train = Y.iloc[:train_size]
 
-        t_v_transf_test = self.scaler.transform(X_test.loc[:, ["T", "vix"]])
-        X_test["T"] = t_v_transf_test[:, 0]
-        X_test["vix"] = t_v_transf_test[:, 1]
+        X_val = X.iloc[train_size: train_size + val_size]
+        Y_val = Y.iloc[train_size: train_size + val_size]
 
-        X_test, X_val, Y_test, Y_val = train_test_split(X_test, Y_test, train_size=0.7, random_state=42, shuffle=True)
+        X_test = X.iloc[train_size + val_size:]
+        Y_test = Y.iloc[train_size + val_size:]
 
-        train = X_train.values.astype(np.float32) #self.scaler.fit_transform(X_train).astype(np.float32)
-        test = X_test.values.astype(np.float32)#self.scaler.transform(X_test).astype(np.float32)
-        val = X_val.values.astype(np.float32)#self.scaler.transform(X_val).astype(np.float32)
+        train_scaled_t_v = self.x_scaler.fit_transform(X_train.loc[:, ["T", "vix"]])
+        X_train.loc[:, "T"] = train_scaled_t_v[:, 0]
+        X_train.loc[:, "vix"] = train_scaled_t_v[:, 1]
 
-        Y_train = self.y_scaler.fit_transform(Y_train.values.reshape(-1, 1))
-        Y_test = self.y_scaler.transform(Y_test.values.reshape(-1, 1))
-        Y_val = self.y_scaler.transform(Y_val.values.reshape(-1, 1))
+        test_scaled_t_v = self.x_scaler.transform(X_test.loc[:, ["T", "vix"]])
+        X_test.loc[:, "T"] = test_scaled_t_v[:, 0]
+        X_test.loc[:, "vix"] = test_scaled_t_v[:, 1]
 
-        print(f"Train: {len(train)} | Validation: {len(val)} | Test: {len(test)}")
+        val_scaled_t_v = self.x_scaler.transform(X_val.loc[:, ["T", "vix"]])
+        X_val.loc[:, "T"] = val_scaled_t_v[:, 0]
+        X_val.loc[:, "vix"] = val_scaled_t_v[:, 1]
 
-        X_tr = torch.from_numpy(train).to(torch.float32)
-        y_tr = torch.from_numpy(Y_train).to(torch.float32)
-        X_te = torch.from_numpy(test).to(torch.float32)
-        y_te = torch.from_numpy(Y_test).to(torch.float32)
-        X_va = torch.from_numpy(val).to(torch.float32)
-        y_va = torch.from_numpy(Y_val).to(torch.float32)
+        Y_train = Y_train.values.reshape(-1, 1)
+        Y_val = Y_val.values.reshape(-1, 1)
+        Y_test = Y_test.values.reshape(-1, 1)
 
-        self.train = OptionsDataset(X_tr, y_tr)
-        self.test = OptionsDataset(X_te, y_te)
-        self.val = OptionsDataset(X_va, y_va)
+        self.train = OptionsDataset(torch.tensor(X_train.values, dtype=torch.float32),
+                                    torch.tensor(Y_train, dtype=torch.float32))
+        self.val = OptionsDataset(torch.tensor(X_val.values, dtype=torch.float32),
+                                  torch.tensor(Y_val, dtype=torch.float32))
+        self.test = OptionsDataset(torch.tensor(X_test.values, dtype=torch.float32),
+                                   torch.tensor(Y_test, dtype=torch.float32))
+
+        print(f"Train: {len(self.train)} | Validation: {len(self.val)} | Test: {len(self.test)}")
 
     def train_dataloader(self):
         return DataLoader(self.train, batch_size=self.batch_size, shuffle=True, num_workers=4, persistent_workers=True)
