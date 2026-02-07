@@ -54,11 +54,13 @@ class OptionsDataModule(pl.LightningDataModule):
             final_df = pd.merge(final_df, sofr_df, on="date", how="inner")
 
         final_df["Price"] = final_df["Price"] / final_df["K"]
+        final_df["vix"] = final_df["vix"] / 100
+        final_df["T"] = final_df["T"] / 365
 
         X = final_df.loc[:, ["S", "K", "T", "vix", 'hv_10', 'hv_14', 'hv_30', 'hv_60', 'hv_91', 'sofr']]
         Y = final_df.loc[:, "Price"]
 
-        train_size = int(len(X) * 0.8)
+        train_size = int(len(X) * 0.9)
         val_size = int(len(X) * 0.1)
 
         X_train = X.iloc[:train_size]
@@ -70,17 +72,17 @@ class OptionsDataModule(pl.LightningDataModule):
         X_test = X.iloc[train_size + val_size:]
         Y_test = Y.iloc[train_size + val_size:]
 
-        train_scaled_t_v = self.x_scaler.fit_transform(X_train.loc[:, ["T", "vix"]])
-        X_train.loc[:, "T"] = train_scaled_t_v[:, 0]
-        X_train.loc[:, "vix"] = train_scaled_t_v[:, 1]
+        #train_scaled_t_v = self.x_scaler.fit_transform(X_train.loc[:, ["T"]])
+        #X_train.loc[:, "T"] = train_scaled_t_v[:, 0]
+        #X_train.loc[:, "vix"] = train_scaled_t_v[:, 1]
 
-        test_scaled_t_v = self.x_scaler.transform(X_test.loc[:, ["T", "vix"]])
-        X_test.loc[:, "T"] = test_scaled_t_v[:, 0]
-        X_test.loc[:, "vix"] = test_scaled_t_v[:, 1]
+        #test_scaled_t_v = self.x_scaler.transform(X_test.loc[:, ["T"]])
+        #X_test.loc[:, "T"] = test_scaled_t_v[:, 0]
+        #X_test.loc[:, "vix"] = test_scaled_t_v[:, 1]
 
-        val_scaled_t_v = self.x_scaler.transform(X_val.loc[:, ["T", "vix"]])
-        X_val.loc[:, "T"] = val_scaled_t_v[:, 0]
-        X_val.loc[:, "vix"] = val_scaled_t_v[:, 1]
+        #val_scaled_t_v = self.x_scaler.transform(X_val.loc[:, ["T"]])
+        #X_val.loc[:, "T"] = val_scaled_t_v[:, 0]
+        #X_val.loc[:, "vix"] = val_scaled_t_v[:, 1]
 
         Y_train = Y_train.values.reshape(-1, 1)
         Y_val = Y_val.values.reshape(-1, 1)
