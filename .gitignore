@@ -1,7 +1,8 @@
-./ml-runs
-./logs
-./docs
-./Surface
-./.venv
-./__pycache__
-./.idea
+/ml-runs
+/logs
+/docs
+/Surface
+/.venv
+/__pycache__
+/.idea
+/ml-runs/
