@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Tuple, Dict
 
 import torch
 import torch.nn as nn
@@ -8,37 +8,91 @@ from torch.optim import Adam
 
 
 class GreeksInformedLoss(nn.Module):
-    def __init__(self, lambda_arb = 1.0):
+    def __init__(
+            self,
+            lambda_arb = 1.0,
+            theta_floor_base: float = -0.10,
+            theta_floor_slope: float = -0.05,  # more negative floor for longer maturities if slope < 0
+            delta_ceiling: float = 0.9999,
+            price_spot_margin: float = 1e-4,
+            w_delta: float = 1.0,
+            w_delta_upper: float = 1.0,
+            w_dual_delta: float = 1.0,
+            w_gamma: float = 1.0,
+            w_theta: float = 1.0,
+            w_dual_gamma: float = 1.0,
+            w_price_upper: float = 1.0,
+    ):
         super().__init__()
-        self.loss = nn.MSELoss()
+        self.mse = nn.MSELoss()
         self.lambda_arb = lambda_arb
 
-    def forward(self, y_pred, y_true):
-        pred, greeks = y_pred
+        self.theta_floor_base = theta_floor_base
+        self.theta_floor_slope = theta_floor_slope
+        self.delta_ceiling = delta_ceiling
+        self.price_spot_margin = price_spot_margin
 
-        loss = self.loss(pred, y_true)
+        self.w_delta = w_delta
+        self.w_delta_upper = w_delta_upper
+        self.w_dual_delta = w_dual_delta
+        self.w_gamma = w_gamma
+        self.w_theta = w_theta
+        self.w_dual_gamma = w_dual_gamma
+        self.w_price_upper = w_price_upper
+
+    def forward(
+            self,
+            y_pred: Tuple[torch.Tensor, Dict[str, torch.Tensor]],
+            y_true: torch.Tensor,
+            t: torch.Tensor, # maturity from input batch, [B, 1]
+            s: torch.Tensor,
+            k: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+
+        pred, greeks = y_pred
+        mse_loss = self.mse(pred, y_true)
 
         delta = greeks["delta"]
         dual_delta = greeks["dual_delta"]
         gamma = greeks["gamma"]
         theta = greeks["theta"]
         dual_gamma = greeks["dual_gamma"]
+        call_prices = pred * k
 
+        theta_floor = self.theta_floor_base + self.theta_floor_slope * t
 
-        delta_loss = torch.mean(torch.relu(-delta) ** 2)
-        dual_delta_loss = torch.mean(torch.relu(dual_delta) ** 2)
-        gamma_loss = torch.mean(torch.relu(-gamma) ** 2)
-        theta_loss = torch.mean(torch.relu(-theta) ** 2)
-        dual_gamma_loss = torch.mean(torch.relu(-dual_gamma) ** 2)
+        delta_loss = torch.relu(-delta).pow(2).mean()
+        delta_upper_loss = torch.relu(delta - self.delta_ceiling).pow(2).mean()
+        dual_delta_loss = torch.relu(dual_delta).pow(2).mean()
+        gamma_loss = torch.relu(-gamma).pow(2).mean()
+        theta_loss = torch.relu(theta_floor - theta).pow(2).mean()
+        dual_gamma_loss = torch.relu(-dual_gamma).pow(2).mean()
+        price_upper_loss = torch.relu(call_prices - (s - self.price_spot_margin)).pow(2).mean()
+
+        greek_penalty = (
+            self.w_delta * delta_loss
+            + self.w_delta_upper * delta_upper_loss
+            + self.w_dual_delta * dual_delta_loss
+            + self.w_gamma * gamma_loss
+            + self.w_theta * theta_loss
+            + self.w_dual_gamma * dual_gamma_loss
+            + self.w_price_upper * price_upper_loss
+        )
+
+        total_loss = mse_loss + self.lambda_arb * greek_penalty
 
         return {
-            "loss": loss + self.lambda_arb * (delta_loss + theta_loss + gamma_loss + dual_delta_loss + dual_gamma_loss),
-            "mse_loss": loss,
+            "loss": total_loss,
+            "mse_loss": mse_loss,
+            "greek_penalty": greek_penalty,
             "delta_loss": delta_loss,
+            "delta_upper_loss": delta_upper_loss,
             "gamma_loss": gamma_loss,
             "theta_loss": theta_loss,
             "dual_delta_loss": dual_delta_loss,
             "dual_gamma_loss": dual_gamma_loss,
+            "price_upper_loss": price_upper_loss,
+            "theta_floor_mean": theta_floor.mean(),
         }
 
 class OptionNet(nn.Module):
@@ -53,7 +107,6 @@ class OptionNet(nn.Module):
                 nn.Linear(input_dims, n_hidden)
             )
             layers.append(nn.Softplus())
-            #layers.append(nn.Tanh())
             input_dims = n_hidden
 
         layers.append(nn.Linear(n_hidden, 1))
@@ -61,22 +114,23 @@ class OptionNet(nn.Module):
 
         self.model = nn.Sequential(*layers)
 
-    def compute_greeks(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor):
 
-        s = x[:, 0:1].requires_grad_(True)
-        k = x[:, 1:2].requires_grad_(True)
-        t = x[:, 2:3].requires_grad_(True)
-        rest = x[:, 3:].requires_grad_(True)
+        xg = x.detach().requires_grad_(True)
+
+        s = xg[:, 0:1]
+        k = xg[:, 1:2]
+        t = xg[:, 2:3]
+        rest = xg[:, 3:]
 
         m = s / k
 
         model_input = torch.cat([m, t, rest], dim=1)
 
         normalized_prices = self.model(model_input)
-
         prices = normalized_prices * k
 
-        grads = torch.autograd.grad(
+        delta, dual_delta, theta = torch.autograd.grad(
             outputs=prices,
             inputs=[s, k, t],
             grad_outputs=torch.ones_like(prices),
@@ -84,10 +138,6 @@ class OptionNet(nn.Module):
             retain_graph=True,
             only_inputs=True,
         )
-
-        delta = grads[0]
-        dual_delta = grads[1]
-        theta = grads[2]
 
         gamma = torch.autograd.grad(
             outputs=delta,
@@ -107,35 +157,32 @@ class OptionNet(nn.Module):
             only_inputs=True,
         )[0]
 
-        return {
+        greeks = {
             "delta": delta,
-            "gamma": gamma,
             "dual_delta": dual_delta,
+            "gamma": gamma,
             "dual_gamma": dual_gamma,
             "theta": theta,
-            "vega": 0,
-            "rho": 0
         }
 
-    def forward(self, x):
-
-        s = x[:, 0:1]
-        k = x[:, 1:2]
-        t = x[:, 2:3]
-        rest = x[:, 3:]
-
-        m = s / k
-
-        model_input = torch.cat([m, t, rest], dim=1)
-
-        predictions = self.model(model_input)
-
-        greeks = self.compute_greeks(x)
-
-        return predictions, greeks
+        return normalized_prices, greeks
 
 class OptionNetModule(pl.LightningModule):
-    def __init__(self, n_inputs=3, n_hidden=64, n_layers=4, lambda_arb = 1.0, learning_rate=1e-3, example_inputs = None):
+    def __init__(
+            self,
+            n_inputs=3,
+            n_hidden=64,
+            n_layers=4,
+            lambda_arb = 1.0,
+            theta_floor_base: float = -0.10,
+            theta_floor_slope: float = -0.05,
+            delta_ceiling: float = 0.9999,
+            price_spot_margin: float = 1e-4,
+            w_delta_upper: float = 1.0,
+            w_price_upper: float = 1.0,
+            learning_rate=1e-3,
+            example_inputs = None
+    ):
         super().__init__()
         self.save_hyperparameters()
 
@@ -146,7 +193,13 @@ class OptionNetModule(pl.LightningModule):
         )
 
         self.loss_fn = GreeksInformedLoss(
-            lambda_arb=lambda_arb
+            lambda_arb=lambda_arb,
+            theta_floor_base=theta_floor_base,
+            theta_floor_slope=theta_floor_slope,
+            delta_ceiling=delta_ceiling,
+            price_spot_margin=price_spot_margin,
+            w_delta_upper=w_delta_upper,
+            w_price_upper=w_price_upper,
         )
 
         self.lambda_arb = lambda_arb
@@ -155,29 +208,42 @@ class OptionNetModule(pl.LightningModule):
     def forward(self, x):
         return self.model(x)
 
-    def training_step(self, batch, batch_idx):
+    def _shared_step(self, batch, stage: str):
         x, y = batch
-
         y_pred = self(x)
+        t = x[:, 2:3]
+        s = x[:, 0:1]
+        k = x[:, 1:2]
+        loss_dict = self.loss_fn(y_pred, y, t=t, s=s, k=k)
 
-        loss = self.loss_fn(y_pred, y)
+        # Core logs
+        self.log(f"{stage}_loss", loss_dict["loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"{stage}_mse_loss", loss_dict["mse_loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"{stage}_greeks_loss", self.lambda_arb * loss_dict["greek_penalty"], on_step=True, on_epoch=True,
+                 prog_bar=True, logger=True)
 
-        self.log("train_loss", loss["loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("train_mse_loss", loss["mse_loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("train_delta_loss", loss["delta_loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("train_gamma_loss", loss["gamma_loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("train_theta_loss", loss["theta_loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("train_dual_gamma_loss", loss["dual_gamma_loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("train_dual_delta_loss", loss["dual_delta_loss"], on_step=True, on_epoch=True, prog_bar=True,
+        # Component logs
+        self.log(f"{stage}_delta_loss", loss_dict["delta_loss"], on_step=True, on_epoch=True, prog_bar=False,
                  logger=True)
-        self.log("train_greeks_loss", self.lambda_arb * (loss["mse_loss"] +
-                loss["delta_loss"]+
-                loss["gamma_loss"]+
-                loss["theta_loss"]+
-                loss["dual_gamma_loss"] + loss["dual_delta_loss"]), on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"{stage}_delta_upper_loss", loss_dict["delta_upper_loss"], on_step=True, on_epoch=True,
+                 prog_bar=False, logger=True)
+        self.log(f"{stage}_gamma_loss", loss_dict["gamma_loss"], on_step=True, on_epoch=True, prog_bar=False,
+                 logger=True)
+        self.log(f"{stage}_theta_loss", loss_dict["theta_loss"], on_step=True, on_epoch=True, prog_bar=False,
+                 logger=True)
+        self.log(f"{stage}_dual_delta_loss", loss_dict["dual_delta_loss"], on_step=True, on_epoch=True, prog_bar=False,
+                 logger=True)
+        self.log(f"{stage}_dual_gamma_loss", loss_dict["dual_gamma_loss"], on_step=True, on_epoch=True, prog_bar=False,
+                 logger=True)
+        self.log(f"{stage}_price_upper_loss", loss_dict["price_upper_loss"], on_step=True, on_epoch=True,
+                 prog_bar=False, logger=True)
+        self.log(f"{stage}_theta_floor_mean", loss_dict["theta_floor_mean"], on_step=True, on_epoch=True,
+                 prog_bar=False, logger=True)
 
+        return loss_dict
 
-        return loss
+    def training_step(self, batch, batch_idx):
+        return self._shared_step(batch, stage="train")
 
     def on_validation_model_eval(self) -> None:
         super().on_validation_model_eval()
@@ -188,68 +254,24 @@ class OptionNetModule(pl.LightningModule):
         torch.set_grad_enabled(True)
 
     def test_step(self, batch, batch_idx):
-        x, y = batch
-
-        y_pred = self(x)
-
-        loss = self.loss_fn(y_pred, y)
-
-        self.log("test_loss", loss["loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("test_mse_loss", loss["mse_loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("test_delta_loss", loss["delta_loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("test_gamma_loss", loss["gamma_loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("test_theta_loss", loss["theta_loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("test_dual_gamma_loss", loss["dual_gamma_loss"], on_step=True, on_epoch=True, prog_bar=True,
-                 logger=True)
-        self.log("test_dual_delta_loss", loss["dual_delta_loss"], on_step=True, on_epoch=True, prog_bar=True,
-                 logger=True)
-        self.log("test_greeks_loss", self.lambda_arb * (loss["mse_loss"] +
-                                                       loss["delta_loss"] +
-                                                       loss["gamma_loss"] +
-                                                       loss["theta_loss"] +
-                                                       loss["dual_gamma_loss"] + loss["dual_delta_loss"]),
-                 on_step=True, on_epoch=True, prog_bar=True, logger=True)
-
-        return loss
+        return self._shared_step(batch, stage="test")
 
     def validation_step(self, batch, batch_idx):
-        x, y = batch
-
-        y_pred = self(x)
-
-        loss = self.loss_fn(y_pred, y)
-
-        self.log("val_loss", loss["loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("val_mse_loss", loss["mse_loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("val_delta_loss", loss["delta_loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("val_gamma_loss", loss["gamma_loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("val_theta_loss", loss["theta_loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("val_dual_gamma_loss", loss["dual_gamma_loss"], on_step=True, on_epoch=True, prog_bar=True,
-                 logger=True)
-        self.log("val_dual_delta_loss", loss["dual_delta_loss"], on_step=True, on_epoch=True, prog_bar=True,
-                 logger=True)
-        self.log("val_greeks_loss", self.lambda_arb * (loss["mse_loss"] +
-                                                         loss["delta_loss"] +
-                                                         loss["gamma_loss"] +
-                                                         loss["theta_loss"] +
-                                                         loss["dual_gamma_loss"] + loss["dual_delta_loss"]),
-                 on_step=True, on_epoch=True, prog_bar=True, logger=True)
-
-        return loss
+        return self._shared_step(batch, stage="val")
 
     def configure_optimizers(self):
         optimizer = Adam(self.parameters(), lr=self.hparams.learning_rate)
 
         scheduler = {
-            'scheduler': ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5),
+            'scheduler': ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=5),
             'monitor': 'val_loss',
             'interval': 'epoch',
             'frequency': 1
         }
 
-        return [optimizer], [StepLR(optimizer, step_size=7, gamma=0.9), scheduler]
+        scheduler1 = StepLR(optimizer, step_size=5, gamma=0.9)
 
-
+        return [optimizer], [scheduler1]
 
 
 

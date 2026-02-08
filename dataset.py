@@ -60,8 +60,8 @@ class OptionsDataModule(pl.LightningDataModule):
         X = final_df.loc[:, ["S", "K", "T", "vix", 'hv_10', 'hv_14', 'hv_30', 'hv_60', 'hv_91', 'sofr']]
         Y = final_df.loc[:, "Price"]
 
-        train_size = int(len(X) * 0.9)
-        val_size = int(len(X) * 0.1)
+        train_size = int(len(X) * 0.85)
+        val_size = int(len(X) * 0.05)
 
         X_train = X.iloc[:train_size]
         Y_train = Y.iloc[:train_size]
