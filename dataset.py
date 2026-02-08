@@ -60,17 +60,36 @@ class OptionsDataModule(pl.LightningDataModule):
         X = final_df.loc[:, ["S", "K", "T", "vix", 'hv_10', 'hv_14', 'hv_30', 'hv_60', 'hv_91', 'sofr']]
         Y = final_df.loc[:, "Price"]
 
-        train_size = int(len(X) * 0.85)
-        val_size = int(len(X) * 0.05)
+        unique_dates = np.sort(final_df["date"].dt.normalize().unique())
+        n_dates = len(unique_dates)
+        if n_dates < 3:
+            raise ValueError(f"Need at least 3 unique dates for train/val/test split, got {n_dates}.")
 
-        X_train = X.iloc[:train_size]
-        Y_train = Y.iloc[:train_size]
+        train_date_count = max(1, int(n_dates * 0.85))
+        val_date_count = max(1, int(n_dates * 0.05))
 
-        X_val = X.iloc[train_size: train_size + val_size]
-        Y_val = Y.iloc[train_size: train_size + val_size]
+        if train_date_count + val_date_count >= n_dates:
+            if val_date_count > 1:
+                val_date_count -= 1
+            else:
+                train_date_count = max(1, train_date_count - 1)
 
-        X_test = X.iloc[train_size + val_size:]
-        Y_test = Y.iloc[train_size + val_size:]
+        train_dates = unique_dates[:train_date_count]
+        val_dates = unique_dates[train_date_count: train_date_count + val_date_count]
+        test_dates = unique_dates[train_date_count + val_date_count:]
+
+        train_mask = final_df["date"].dt.normalize().isin(train_dates)
+        val_mask = final_df["date"].dt.normalize().isin(val_dates)
+        test_mask = final_df["date"].dt.normalize().isin(test_dates)
+
+        X_train = X.loc[train_mask]
+        Y_train = Y.loc[train_mask]
+
+        X_val = X.loc[val_mask]
+        Y_val = Y.loc[val_mask]
+
+        X_test = X.loc[test_mask]
+        Y_test = Y.loc[test_mask]
 
         #train_scaled_t_v = self.x_scaler.fit_transform(X_train.loc[:, ["T"]])
         #X_train.loc[:, "T"] = train_scaled_t_v[:, 0]
@@ -95,7 +114,10 @@ class OptionsDataModule(pl.LightningDataModule):
         self.test = OptionsDataset(torch.tensor(X_test.values, dtype=torch.float32),
                                    torch.tensor(Y_test, dtype=torch.float32))
 
-        print(f"Train: {len(self.train)} | Validation: {len(self.val)} | Test: {len(self.test)}")
+        print(
+            f"Date split -> Train: {len(train_dates)} | Validation: {len(val_dates)} | Test: {len(test_dates)}"
+        )
+        print(f"Rows -> Train: {len(self.train)} | Validation: {len(self.val)} | Test: {len(self.test)}")
 
     def train_dataloader(self):
         return DataLoader(self.train, batch_size=self.batch_size, shuffle=True, num_workers=4, persistent_workers=True)
@@ -103,6 +125,4 @@ class OptionsDataModule(pl.LightningDataModule):
          return DataLoader(self.val, batch_size=self.batch_size, shuffle=False, num_workers=4, persistent_workers=True)
     def test_dataloader(self):
          return DataLoader(self.test, batch_size=self.batch_size, shuffle=False, num_workers=4, persistent_workers=True)
-
-
 

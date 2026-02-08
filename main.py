@@ -1,29 +1,50 @@
 import warnings
+from datetime import datetime
+from pathlib import Path
+
 import torch
 
 from dataset import OptionsDataModule
 from model import OptionNetModule
 import lightning as pl
+from lightning.pytorch.callbacks import ModelCheckpoint
 warnings.filterwarnings("ignore")
 
 if __name__ == "__main__":
-    lr = 1e-6
-    EPOCHS = 1
-    batch_size = 128
-    LAMBDA_ARB = 10.0
+    lr = 7e-4
+    EPOCHS = 100
+    batch_size = 1024
+    LAMBDA_ARB = 2.0
 
     torch.manual_seed(42)
 
-    from lightning.pytorch.loggers import LitLogger, TensorBoardLogger
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    checkpoint_dir = Path("./checkpoints") / f"run_{run_id}"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    data_module = OptionsDataModule("./data/108105", batch_size=batch_size)
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=str(checkpoint_dir),
+        filename="epoch={epoch:02d}-step={step}",
+        save_last=True,
+        auto_insert_metric_name=False,
+    )
+
+    import mlflow
+    from lightning.pytorch.loggers import MLFlowLogger
+
+    from lightning.pytorch.callbacks import LearningRateMonitor
+
+    data_module = OptionsDataModule("./data/108105", sofr_path="./data/sofr.csv", batch_size=batch_size)
+    lr_monitor = LearningRateMonitor(logging_interval='epoch')
 
     model = OptionNetModule(
-        n_inputs=3,
-        n_hidden=128,
+        n_inputs=9,
+        n_hidden=64,
         n_layers=2,
         lambda_arb=LAMBDA_ARB,
-        learning_rate=lr
+        theta_floor_base=-0.03,
+        theta_floor_slope=0.0393,
+        learning_rate=lr,
     )
 
     trainer = pl.Trainer(
@@ -31,37 +52,13 @@ if __name__ == "__main__":
         accelerator="auto",
         devices=1,
         enable_progress_bar=True,
+        gradient_clip_val=1.0,
+        gradient_clip_algorithm="norm",
         log_every_n_steps=10,
-        logger=TensorBoardLogger("./logs/", name="my_experiment")
+        logger=MLFlowLogger(experiment_name="surfaces", tracking_uri="file:./ml-runs", log_model="all"),
+        callbacks=[lr_monitor, checkpoint_callback],
+        inference_mode=False,
     )
 
     trainer.fit(model, data_module)
-
-    # Visualization
-    import matplotlib.pyplot as plt
-    import numpy as np
-
-    model.eval()
-    val_loader = data_module.val_dataloader()
-
-    all_preds = []
-    all_actuals = []
-
-    with torch.no_grad():
-        for batch in val_loader:
-            x, y = batch
-            preds, _ = model(x)
-            all_preds.append(preds.numpy())
-            all_actuals.append(y.numpy())
-
-    all_preds = np.concatenate(all_preds).flatten()
-    all_actuals = np.concatenate(all_actuals).flatten()
-
-    plt.figure(figsize=(10, 6))
-    plt.scatter(all_actuals, all_preds, alpha=0.5)
-    plt.plot([all_actuals.min(), all_actuals.max()], [all_actuals.min(), all_actuals.max()], 'r--')
-    plt.xlabel('Actual Price')
-    plt.ylabel('Predicted Price')
-    plt.title('Predicted vs Actual Option Prices')
-    plt.savefig('predicted_vs_actual.png')
-    print("Scatterplot saved to predicted_vs_actual.png")
+    trainer.test(model, data_module)

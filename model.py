@@ -11,8 +11,9 @@ class GreeksInformedLoss(nn.Module):
     def __init__(
             self,
             lambda_arb = 1.0,
-            theta_floor_base: float = -0.10,
-            theta_floor_slope: float = -0.05,  # more negative floor for longer maturities if slope < 0
+            theta_floor_base: float = -0.03,
+            theta_floor_slope: float = 0.0393,  # tuned on training data: ~5-10th pct of theoretical theta/K by maturity
+            theta_floor_eps: float = 1e-4,
             delta_ceiling: float = 0.9999,
             price_spot_margin: float = 1e-4,
             w_delta: float = 1.0,
@@ -20,6 +21,7 @@ class GreeksInformedLoss(nn.Module):
             w_dual_delta: float = 1.0,
             w_gamma: float = 1.0,
             w_theta: float = 1.0,
+            w_theta_upper: float = 1.0,
             w_dual_gamma: float = 1.0,
             w_price_upper: float = 1.0,
     ):
@@ -29,6 +31,7 @@ class GreeksInformedLoss(nn.Module):
 
         self.theta_floor_base = theta_floor_base
         self.theta_floor_slope = theta_floor_slope
+        self.theta_floor_eps = theta_floor_eps
         self.delta_ceiling = delta_ceiling
         self.price_spot_margin = price_spot_margin
 
@@ -37,6 +40,7 @@ class GreeksInformedLoss(nn.Module):
         self.w_dual_delta = w_dual_delta
         self.w_gamma = w_gamma
         self.w_theta = w_theta
+        self.w_theta_upper = w_theta_upper
         self.w_dual_gamma = w_dual_gamma
         self.w_price_upper = w_price_upper
 
@@ -59,13 +63,21 @@ class GreeksInformedLoss(nn.Module):
         dual_gamma = greeks["dual_gamma"]
         call_prices = pred * k
 
-        theta_floor = self.theta_floor_base + self.theta_floor_slope * t
+        # Normalize theta by strike so floor parameters are in normalized-price units.
+        theta_normalized = theta / torch.clamp(k, min=1e-8)
+        # Nonlinear floor: very negative near expiry, relaxing toward base at long maturities.
+        theta_floor = self.theta_floor_base - self.theta_floor_slope / torch.sqrt(
+            torch.clamp(t, min=self.theta_floor_eps)
+        )
+        # Keep floor non-positive to remain consistent with call-theta calendar monotonicity (theta <= 0).
+        theta_floor = torch.minimum(theta_floor, torch.zeros_like(theta_floor))
 
         delta_loss = torch.relu(-delta).pow(2).mean()
         delta_upper_loss = torch.relu(delta - self.delta_ceiling).pow(2).mean()
         dual_delta_loss = torch.relu(dual_delta).pow(2).mean()
         gamma_loss = torch.relu(-gamma).pow(2).mean()
-        theta_loss = torch.relu(theta_floor - theta).pow(2).mean()
+        theta_loss = torch.relu(theta_floor - theta_normalized).pow(2).mean()
+        theta_upper_loss = torch.relu(theta).pow(2).mean()
         dual_gamma_loss = torch.relu(-dual_gamma).pow(2).mean()
         price_upper_loss = torch.relu(call_prices - (s - self.price_spot_margin)).pow(2).mean()
 
@@ -75,6 +87,7 @@ class GreeksInformedLoss(nn.Module):
             + self.w_dual_delta * dual_delta_loss
             + self.w_gamma * gamma_loss
             + self.w_theta * theta_loss
+            + self.w_theta_upper * theta_upper_loss
             + self.w_dual_gamma * dual_gamma_loss
             + self.w_price_upper * price_upper_loss
         )
@@ -89,6 +102,7 @@ class GreeksInformedLoss(nn.Module):
             "delta_upper_loss": delta_upper_loss,
             "gamma_loss": gamma_loss,
             "theta_loss": theta_loss,
+            "theta_upper_loss": theta_upper_loss,
             "dual_delta_loss": dual_delta_loss,
             "dual_gamma_loss": dual_gamma_loss,
             "price_upper_loss": price_upper_loss,
@@ -162,7 +176,7 @@ class OptionNet(nn.Module):
             "dual_delta": dual_delta,
             "gamma": gamma,
             "dual_gamma": dual_gamma,
-            "theta": theta,
+            "theta": -theta,
         }
 
         return normalized_prices, greeks
@@ -174,11 +188,13 @@ class OptionNetModule(pl.LightningModule):
             n_hidden=64,
             n_layers=4,
             lambda_arb = 1.0,
-            theta_floor_base: float = -0.10,
-            theta_floor_slope: float = -0.05,
+            theta_floor_base: float = -0.03,
+            theta_floor_slope: float = 0.0393,
+            theta_floor_eps: float = 1e-4,
             delta_ceiling: float = 0.9999,
             price_spot_margin: float = 1e-4,
             w_delta_upper: float = 1.0,
+            w_theta_upper: float = 1.0,
             w_price_upper: float = 1.0,
             learning_rate=1e-3,
             example_inputs = None
@@ -196,9 +212,11 @@ class OptionNetModule(pl.LightningModule):
             lambda_arb=lambda_arb,
             theta_floor_base=theta_floor_base,
             theta_floor_slope=theta_floor_slope,
+            theta_floor_eps=theta_floor_eps,
             delta_ceiling=delta_ceiling,
             price_spot_margin=price_spot_margin,
             w_delta_upper=w_delta_upper,
+            w_theta_upper=w_theta_upper,
             w_price_upper=w_price_upper,
         )
 
@@ -231,6 +249,8 @@ class OptionNetModule(pl.LightningModule):
                  logger=True)
         self.log(f"{stage}_theta_loss", loss_dict["theta_loss"], on_step=True, on_epoch=True, prog_bar=False,
                  logger=True)
+        self.log(f"{stage}_theta_upper_loss", loss_dict["theta_upper_loss"], on_step=True, on_epoch=True,
+                 prog_bar=False, logger=True)
         self.log(f"{stage}_dual_delta_loss", loss_dict["dual_delta_loss"], on_step=True, on_epoch=True, prog_bar=False,
                  logger=True)
         self.log(f"{stage}_dual_gamma_loss", loss_dict["dual_gamma_loss"], on_step=True, on_epoch=True, prog_bar=False,
@@ -269,9 +289,6 @@ class OptionNetModule(pl.LightningModule):
             'frequency': 1
         }
 
-        scheduler1 = StepLR(optimizer, step_size=5, gamma=0.9)
+        scheduler1 = StepLR(optimizer, step_size=6, gamma=0.9)
 
         return [optimizer], [scheduler1]
-
-
-
