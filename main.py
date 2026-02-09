@@ -12,7 +12,7 @@ warnings.filterwarnings("ignore")
 
 if __name__ == "__main__":
     lr = 7e-4
-    EPOCHS = 100
+    EPOCHS = 300
     batch_size = 1024
     LAMBDA_ARB = 2.0
 

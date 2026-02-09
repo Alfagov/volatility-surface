@@ -12,7 +12,7 @@ class GreeksInformedLoss(nn.Module):
             self,
             lambda_arb = 1.0,
             theta_floor_base: float = -0.03,
-            theta_floor_slope: float = 0.0393,  # tuned on training data: ~5-10th pct of theoretical theta/K by maturity
+            theta_floor_slope: float = 0.0393,
             theta_floor_eps: float = 1e-4,
             delta_ceiling: float = 0.9999,
             price_spot_margin: float = 1e-4,
@@ -48,7 +48,7 @@ class GreeksInformedLoss(nn.Module):
             self,
             y_pred: Tuple[torch.Tensor, Dict[str, torch.Tensor]],
             y_true: torch.Tensor,
-            t: torch.Tensor, # maturity from input batch, [B, 1]
+            t: torch.Tensor,
             s: torch.Tensor,
             k: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
@@ -63,13 +63,15 @@ class GreeksInformedLoss(nn.Module):
         dual_gamma = greeks["dual_gamma"]
         call_prices = pred * k
 
-        # Normalize theta by strike so floor parameters are in normalized-price units.
+        # Normalize theta to K
         theta_normalized = theta / torch.clamp(k, min=1e-8)
-        # Nonlinear floor: very negative near expiry, relaxing toward base at long maturities.
+
+        # Calculate the theta floor based on Time-to-Maturity
         theta_floor = self.theta_floor_base - self.theta_floor_slope / torch.sqrt(
             torch.clamp(t, min=self.theta_floor_eps)
         )
-        # Keep floor non-positive to remain consistent with call-theta calendar monotonicity (theta <= 0).
+
+        # Allow only negative floors this is for Call options
         theta_floor = torch.minimum(theta_floor, torch.zeros_like(theta_floor))
 
         delta_loss = torch.relu(-delta).pow(2).mean()
@@ -79,6 +81,8 @@ class GreeksInformedLoss(nn.Module):
         theta_loss = torch.relu(theta_floor - theta_normalized).pow(2).mean()
         theta_upper_loss = torch.relu(theta).pow(2).mean()
         dual_gamma_loss = torch.relu(-dual_gamma).pow(2).mean()
+
+        # Call cannot cost more than the underlying asset
         price_upper_loss = torch.relu(call_prices - (s - self.price_spot_margin)).pow(2).mean()
 
         greek_penalty = (
