@@ -160,6 +160,9 @@ def main() -> None:
     df = df[df["cp_flag"] == args.cp_flag].copy()
     if df.empty:
         raise ValueError(f"No rows found for cp_flag={args.cp_flag}.")
+    df = df[df["days"] <= 365].copy()
+    if df.empty:
+        raise ValueError("No rows found with maturity <= 365 days after filtering.")
 
     target_date = pd.to_datetime(args.date) if args.date else df["date"].max()
     daily = df[df["date"] == target_date].copy()

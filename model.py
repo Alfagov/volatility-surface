@@ -2,9 +2,11 @@ from typing import Any, Tuple, Dict
 
 import torch
 import torch.nn as nn
+import torchmetrics.functional
 from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
 import lightning as pl
 from torch.optim import Adam
+from torchmetrics import MeanAbsolutePercentageError, MeanSquaredLogError
 
 
 class GreeksInformedLoss(nn.Module):
@@ -24,9 +26,10 @@ class GreeksInformedLoss(nn.Module):
             w_theta_upper: float = 1.0,
             w_dual_gamma: float = 1.0,
             w_price_upper: float = 1.0,
+            vega_weight_eps: float = 1e-8,
     ):
         super().__init__()
-        self.mse = nn.MSELoss()
+        self.price_loss = nn.MSELoss()
         self.lambda_arb = lambda_arb
 
         self.theta_floor_base = theta_floor_base
@@ -43,6 +46,36 @@ class GreeksInformedLoss(nn.Module):
         self.w_theta_upper = w_theta_upper
         self.w_dual_gamma = w_dual_gamma
         self.w_price_upper = w_price_upper
+        self.vega_weight_eps = vega_weight_eps
+
+        self.bucket_weights = {
+            "deep_otm": 1.0,
+            "otm": 1.0,
+            "atm": 1.5,
+            "itm": 3.0,
+            "deep_itm": 4.0,
+        }
+
+    def _moneyness_weights(self, s: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        m = s / torch.clamp(k, min=1e-8)
+        w = torch.ones_like(m)
+
+        w = torch.where(m < 0.90, torch.full_like(w, self.bucket_weights["deep_otm"]), w)
+        w = torch.where((m >= 0.90) & (m < 0.97), torch.full_like(w, self.bucket_weights["otm"]), w)
+        w = torch.where((m >= 0.97) & (m < 1.03), torch.full_like(w, self.bucket_weights["atm"]), w)
+        w = torch.where((m >= 1.03) & (m < 1.10), torch.full_like(w, self.bucket_weights["itm"]), w)
+        w = torch.where(m >= 1.10, torch.full_like(w, self.bucket_weights["deep_itm"]), w)
+        return w
+
+    def weighted_mse_loss(self, out, target):
+        # Add small epsilon to prevent div by zero
+        epsilon = 1e-6
+        # Calculate the squared error
+        squared_error = (out - target) ** 2
+        # Weight by the squared target value (effectively calculating % error squared)
+        weights = 1 / (target ** 2 + epsilon)
+
+        return torch.mean(weights * squared_error)
 
     def forward(
             self,
@@ -54,14 +87,24 @@ class GreeksInformedLoss(nn.Module):
     ) -> Dict[str, torch.Tensor]:
 
         pred, greeks = y_pred
-        mse_loss = self.mse(pred, y_true)
+        # mse_loss = self.price_loss(pred, y_true)
+        #
+        # w = self._moneyness_weights(s, k)
+        # price_loss_vec = mse_loss * w
+        #
+        # mse_loss = price_loss_vec.mean()
 
         delta = greeks["delta"]
         dual_delta = greeks["dual_delta"]
         gamma = greeks["gamma"]
         theta = greeks["theta"]
         dual_gamma = greeks["dual_gamma"]
+        vega = greeks["vega"]
         call_prices = pred * k
+        #squared_error = (call_prices - y_true).pow(2)
+        #vega_weights = torch.clamp(torch.abs(vega).detach(), min=self.vega_weight_eps)
+        vega_weighted_mse = self.price_loss(call_prices, y_true)#(squared_error * vega_weights).sum() / vega_weights.sum()
+
 
         # Normalize theta to K
         theta_normalized = theta / torch.clamp(k, min=1e-8)
@@ -81,6 +124,7 @@ class GreeksInformedLoss(nn.Module):
         theta_loss = torch.relu(theta_floor - theta_normalized).pow(2).mean()
         theta_upper_loss = torch.relu(theta).pow(2).mean()
         dual_gamma_loss = torch.relu(-dual_gamma).pow(2).mean()
+        vega_loss = torch.relu(-vega).pow(2).mean()
 
         # Call cannot cost more than the underlying asset
         price_upper_loss = torch.relu(call_prices - (s - self.price_spot_margin)).pow(2).mean()
@@ -94,13 +138,14 @@ class GreeksInformedLoss(nn.Module):
             + self.w_theta_upper * theta_upper_loss
             + self.w_dual_gamma * dual_gamma_loss
             + self.w_price_upper * price_upper_loss
+            + vega_loss
         )
 
-        total_loss = mse_loss + self.lambda_arb * greek_penalty
+        total_loss = vega_weighted_mse + self.lambda_arb * greek_penalty
 
         return {
             "loss": total_loss,
-            "mse_loss": mse_loss,
+            "mse_loss": vega_weighted_mse,
             "greek_penalty": greek_penalty,
             "delta_loss": delta_loss,
             "delta_upper_loss": delta_upper_loss,
@@ -111,6 +156,8 @@ class GreeksInformedLoss(nn.Module):
             "dual_gamma_loss": dual_gamma_loss,
             "price_upper_loss": price_upper_loss,
             "theta_floor_mean": theta_floor.mean(),
+            "vega_loss": vega_loss,
+            "vega_weighted_mse": vega_weighted_mse,
         }
 
 class OptionNet(nn.Module):
@@ -120,12 +167,20 @@ class OptionNet(nn.Module):
         layers = []
         input_dims = n_inputs
 
-        for _ in range(n_layers):
-            layers.append(
-                nn.Linear(input_dims, n_hidden)
-            )
-            layers.append(nn.Softplus())
-            input_dims = n_hidden
+        layers.append(
+            nn.Linear(input_dims, n_hidden)
+        )
+        layers.append(nn.SiLU())
+
+        layers.append(
+            nn.Linear(n_hidden, n_hidden//2)
+        )
+        layers.append(nn.SiLU())
+
+        layers.append(
+            nn.Linear(n_hidden//2, n_hidden)
+        )
+        layers.append(nn.SiLU())
 
         layers.append(nn.Linear(n_hidden, 1))
         layers.append(nn.Softplus())
@@ -139,18 +194,19 @@ class OptionNet(nn.Module):
         s = xg[:, 0:1]
         k = xg[:, 1:2]
         t = xg[:, 2:3]
-        rest = xg[:, 3:]
+        v = xg[:, 3:4]
+        rest = xg[:, 4:]
 
         m = s / k
 
-        model_input = torch.cat([m, t, rest], dim=1)
+        model_input = torch.cat([m, t, v, rest], dim=1)
 
         normalized_prices = self.model(model_input)
         prices = normalized_prices * k
 
-        delta, dual_delta, theta = torch.autograd.grad(
+        delta, dual_delta, theta, vega = torch.autograd.grad(
             outputs=prices,
-            inputs=[s, k, t],
+            inputs=[s, k, t, v],
             grad_outputs=torch.ones_like(prices),
             create_graph=True,
             retain_graph=True,
@@ -181,6 +237,7 @@ class OptionNet(nn.Module):
             "gamma": gamma,
             "dual_gamma": dual_gamma,
             "theta": -theta,
+            "vega": vega,
         }
 
         return normalized_prices, greeks
@@ -200,6 +257,7 @@ class OptionNetModule(pl.LightningModule):
             w_delta_upper: float = 1.0,
             w_theta_upper: float = 1.0,
             w_price_upper: float = 1.0,
+            vega_weight_eps: float = 1e-8,
             learning_rate=1e-3,
             example_inputs = None
     ):
@@ -222,6 +280,7 @@ class OptionNetModule(pl.LightningModule):
             w_delta_upper=w_delta_upper,
             w_theta_upper=w_theta_upper,
             w_price_upper=w_price_upper,
+            vega_weight_eps=vega_weight_eps,
         )
 
         self.lambda_arb = lambda_arb
@@ -263,6 +322,10 @@ class OptionNetModule(pl.LightningModule):
                  prog_bar=False, logger=True)
         self.log(f"{stage}_theta_floor_mean", loss_dict["theta_floor_mean"], on_step=True, on_epoch=True,
                  prog_bar=False, logger=True)
+        self.log(f"{stage}_vega_loss", loss_dict["vega_loss"], on_step=True, on_epoch=True,
+                 prog_bar=False, logger=True)
+        self.log(f"{stage}_vega_weighted_mse", loss_dict["vega_weighted_mse"], on_step=True, on_epoch=True,
+                 prog_bar=True, logger=True)
 
         return loss_dict
 
@@ -293,6 +356,6 @@ class OptionNetModule(pl.LightningModule):
             'frequency': 1
         }
 
-        scheduler1 = StepLR(optimizer, step_size=6, gamma=0.9)
+        scheduler1 = StepLR(optimizer, step_size=10, gamma=0.95)
 
         return [optimizer], [scheduler1]

@@ -11,10 +11,10 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 warnings.filterwarnings("ignore")
 
 if __name__ == "__main__":
-    lr = 7e-4
+    lr = 1e-4
     EPOCHS = 300
-    batch_size = 1024
-    LAMBDA_ARB = 2.0
+    batch_size = 4196
+    LAMBDA_ARB = 3.0
 
     torch.manual_seed(42)
 
@@ -29,17 +29,15 @@ if __name__ == "__main__":
         auto_insert_metric_name=False,
     )
 
-    import mlflow
     from lightning.pytorch.loggers import MLFlowLogger
-
     from lightning.pytorch.callbacks import LearningRateMonitor
 
     data_module = OptionsDataModule("./data/108105", sofr_path="./data/sofr.csv", batch_size=batch_size)
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
 
     model = OptionNetModule(
-        n_inputs=9,
-        n_hidden=64,
+        n_inputs=6,
+        n_hidden=350,
         n_layers=2,
         lambda_arb=LAMBDA_ARB,
         theta_floor_base=-0.03,
@@ -58,6 +56,7 @@ if __name__ == "__main__":
         logger=MLFlowLogger(experiment_name="surfaces", tracking_uri="file:./ml-runs", log_model="all"),
         callbacks=[lr_monitor, checkpoint_callback],
         inference_mode=False,
+        check_val_every_n_epoch=5
     )
 
     trainer.fit(model, data_module)

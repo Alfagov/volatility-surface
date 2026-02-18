@@ -1,16 +1,90 @@
 import argparse
 from pathlib import Path
-from typing import Iterable
-
+from typing import Iterable, List
+import numpy as np
 import pandas as pd
 import wrds
 
+def interpolate_rates(df: pd.DataFrame, rate_cols: List[str], tenors: List[int]) -> pd.DataFrame:
+    """
+    Linearly interpolates risk-free rates based on option time-to-maturity (T).
+
+    Args:
+        df: DataFrame containing options data and joined rate columns.
+        rate_cols: List of column names for rates (e.g., ['dgs1mo', ...]).
+        tenors: List of days corresponding to rate_cols (e.g., [30, 91, ...]).
+    """
+    # Create arrays for tenors and rates
+    # We want to interpolate 'r' for a given 'T' (days)
+
+    # 1. Handle NaN rates (forward fill just in case, though rates are usually daily)
+    df[rate_cols] = df[rate_cols].ffill()
+
+    # 2. Convert rates from percentage (e.g., 5.25) to decimal (0.0525)
+    # FRB data is usually in percent. Check your source; typical WRDS is percent.
+    rate_values = df[rate_cols].values / 100.0
+
+    # 3. Interpolation Logic
+    # We need to find the specific rate for the specific T of each row.
+    # Since scipy.interpolate is slow on large DFs row-by-row, we implement a numpy lookup.
+
+    T_days = df['T'].values
+    n_rows = len(df)
+    interpolated_r = np.zeros(n_rows)
+
+    # Convert tenors to numpy array
+    tenors_arr = np.array(tenors)
+
+    # Iterate through tenors to find brackets [t_low, t_high]
+    # This is much faster than row-by-row apply
+
+    # Initialize with the shortest rate (for T < first tenor)
+    interpolated_r[:] = rate_values[:, 0]
+
+    for i in range(len(tenors) - 1):
+        t_low = tenors[i]
+        t_high = tenors[i + 1]
+
+        # Mask for rows where T is between these two tenors
+        mask = (T_days >= t_low) & (T_days < t_high)
+
+        if np.any(mask):
+            r_low = rate_values[mask, i]
+            r_high = rate_values[mask, i + 1]
+            dt = T_days[mask]
+
+            # Linear Interpolation formula: y = y0 + (y1-y0) * (x-x0)/(x1-x0)
+            fraction = (dt - t_low) / (t_high - t_low)
+            interpolated_r[mask] = r_low + (r_high - r_low) * fraction
+
+    # Handle T > max tenor (use the longest rate available)
+    mask_long = T_days >= tenors[-1]
+    if np.any(mask_long):
+        interpolated_r[mask_long] = rate_values[mask_long, -1]
+
+    df['rate'] = interpolated_r
+    return df
 
 def download_option_data(secid: str = "108105", years: Iterable[int] = (), option_type: str = "C") -> None:
     db = wrds.Connection()
 
+    tenor_days = [30, 91, 182, 365, 730, 1095, 1825]
+    rate_columns = ["dgs1mo", "dgs3mo", "dgs6mo", "dgs1", "dgs2", "dgs3", "dgs5"]
+
     for year in years:
         print(f"Connecting to WRDS to fetch {secid} for year {year}...")
+
+        print(f"Fetching Yield Curve for {year}...")
+        rates_df = db.raw_sql(f"""
+                        SELECT 
+                            date,
+                            dgs1mo, dgs3mo, dgs6mo, dgs1, dgs2, dgs3, dgs5
+                        FROM 
+                            frb.rates_daily
+                        WHERE 
+                            date >= '{year}-01-01' AND date <= '{year}-12-31'
+                    """)
+        rates_df["date"] = pd.to_datetime(rates_df["date"])
 
         sql_query = f"""
                     SELECT
@@ -22,6 +96,7 @@ def download_option_data(secid: str = "108105", years: Iterable[int] = (), optio
                         o.impl_volatility,
                         s.close as spot_price,
                         inf.exercise_style,
+                        d.rate / 100.0 as dividend_yield,
                         c.vix,
                         v.hv_10,
                         v.hv_14,
@@ -31,13 +106,18 @@ def download_option_data(secid: str = "108105", years: Iterable[int] = (), optio
                         f.sofr as sofr
                     FROM
                         optionm.opprcd{year} as o
-                    JOIN
+                    LEFT JOIN
                         optionm.secprd as s
                         ON o.date = s.date AND o.secid = s.secid
+                    LEFT JOIN
+                        optionm.idxdvd as d
+                        ON o.secid = d.secid 
+                        AND o.date = d.date 
+                        AND o.exdate = d.expiration
                     JOIN
                         cboe.cboe as c
                         ON c.date = s.date
-                    LEFT JOIN (
+                    JOIN (
                         SELECT 
                             date, 
                             secid,
@@ -65,7 +145,6 @@ def download_option_data(secid: str = "108105", years: Iterable[int] = (), optio
                         AND o.cp_flag = '{option_type}'
                         AND o.best_bid > 0.1 
                         AND o.volume > 1
-                        AND o.impl_volatility IS NOT NULL
                         AND inf.exercise_style = 'E'
                     """
 
@@ -81,6 +160,10 @@ def download_option_data(secid: str = "108105", years: Iterable[int] = (), optio
         df["exdate"] = pd.to_datetime(df["exdate"])
         df["T"] = (df["exdate"] - df["date"]).dt.days
         df = df[df["T"] > 1]
+
+        df = pd.merge(df, rates_df, on="date", how="left")
+
+        df = interpolate_rates(df, rate_columns, tenor_days)
 
         final_df = df[
             [
@@ -98,6 +181,8 @@ def download_option_data(secid: str = "108105", years: Iterable[int] = (), optio
                 "impl_volatility",
                 "cp_flag",
                 "exercise_style",
+                "dividend_yield",
+                "rate"
             ]
         ].copy()
         final_df.columns = [
@@ -115,6 +200,8 @@ def download_option_data(secid: str = "108105", years: Iterable[int] = (), optio
             "Impl_Vol",
             "cp_flag",
             "exercise_style",
+            "dividend_yield",
+            "rate"
         ]
         final_df = final_df.sort_values(["date", "K", "T"])
 

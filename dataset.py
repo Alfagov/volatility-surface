@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 
 class OptionsDataset(Dataset):
@@ -33,6 +33,45 @@ class OptionsDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.x_scaler = MinMaxScaler()
         self.y_scaler = MinMaxScaler()
+        self.train_sampler = None
+
+    @staticmethod
+    def _moneyness_bucket_indices(moneyness: np.ndarray) -> np.ndarray:
+        # Bucket 0 intentionally groups deep OTM and deep ITM together.
+        buckets = np.zeros_like(moneyness, dtype=np.int64)
+        buckets[(moneyness >= 0.90) & (moneyness < 0.97)] = 1  # OTM
+        buckets[(moneyness >= 0.97) & (moneyness < 1.03)] = 2  # ATM
+        buckets[(moneyness >= 1.03) & (moneyness < 1.10)] = 3  # ITM
+        return buckets
+
+    def _build_balanced_train_sampler(self, x_train: pd.DataFrame) -> WeightedRandomSampler | None:
+        moneyness = x_train["S"].to_numpy(dtype=np.float64) / np.clip(
+            x_train["K"].to_numpy(dtype=np.float64), 1e-8, None
+        )
+        bucket_indices = self._moneyness_bucket_indices(moneyness)
+
+        bucket_names = ["deep", "otm", "atm", "itm"]
+        bucket_counts = np.bincount(bucket_indices, minlength=len(bucket_names))
+        available_bucket_count = int(np.sum(bucket_counts > 0))
+
+        if available_bucket_count == 0:
+            return None
+
+        per_bucket_weights = np.zeros_like(bucket_counts, dtype=np.float64)
+        per_bucket_weights[bucket_counts > 0] = 1.0 / bucket_counts[bucket_counts > 0]
+        sample_weights = per_bucket_weights[bucket_indices]
+
+        print(
+            "Train moneyness bucket rows -> "
+            + " | ".join(f"{name.upper()}: {int(count)}" for name, count in zip(bucket_names, bucket_counts))
+        )
+        print(f"Train sampler -> balanced across {available_bucket_count} available moneyness buckets per epoch")
+
+        return WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
 
     def setup(self, stage: str) -> None:
         files = glob.glob(self.folder + "/*.csv")
@@ -46,6 +85,13 @@ class OptionsDataModule(pl.LightningDataModule):
         final_df = pd.concat(df_list, ignore_index=True)
         final_df["date"] = pd.to_datetime(final_df["date"])
         final_df = final_df.sort_values("date")
+        final_df = final_df[final_df["T"] < 365]
+        final_df = final_df[final_df["T"] > 14]
+        final_df["M"] = final_df["S"] / final_df["K"]
+        final_df = final_df[final_df["M"] >= 0.5]
+        final_df = final_df[final_df["M"] <= 1.15]
+
+        final_df.dropna(inplace=True)
 
         if self.sofr_path is not None:
             sofr_df = pd.read_csv(self.sofr_path)
@@ -53,11 +99,11 @@ class OptionsDataModule(pl.LightningDataModule):
             sofr_df["sofr"] = sofr_df["sofr"] / 100.0
             final_df = pd.merge(final_df, sofr_df, on="date", how="inner")
 
-        final_df["Price"] = final_df["Price"] / final_df["K"]
+        final_df["Price"] = final_df["Price"]
         final_df["vix"] = final_df["vix"] / 100
         final_df["T"] = final_df["T"] / 365
 
-        X = final_df.loc[:, ["S", "K", "T", "vix", 'hv_10', 'hv_14', 'hv_30', 'hv_60', 'hv_91', 'sofr']]
+        X = final_df.loc[:, ["S", "K", "T", "vix", 'sofr', "dividend_yield", "rate"]]
         Y = final_df.loc[:, "Price"]
 
         unique_dates = np.sort(final_df["date"].dt.normalize().unique())
@@ -91,21 +137,11 @@ class OptionsDataModule(pl.LightningDataModule):
         X_test = X.loc[test_mask]
         Y_test = Y.loc[test_mask]
 
-        #train_scaled_t_v = self.x_scaler.fit_transform(X_train.loc[:, ["T"]])
-        #X_train.loc[:, "T"] = train_scaled_t_v[:, 0]
-        #X_train.loc[:, "vix"] = train_scaled_t_v[:, 1]
-
-        #test_scaled_t_v = self.x_scaler.transform(X_test.loc[:, ["T"]])
-        #X_test.loc[:, "T"] = test_scaled_t_v[:, 0]
-        #X_test.loc[:, "vix"] = test_scaled_t_v[:, 1]
-
-        #val_scaled_t_v = self.x_scaler.transform(X_val.loc[:, ["T"]])
-        #X_val.loc[:, "T"] = val_scaled_t_v[:, 0]
-        #X_val.loc[:, "vix"] = val_scaled_t_v[:, 1]
-
         Y_train = Y_train.values.reshape(-1, 1)
         Y_val = Y_val.values.reshape(-1, 1)
         Y_test = Y_test.values.reshape(-1, 1)
+
+        self.train_sampler = self._build_balanced_train_sampler(X_train)
 
         self.train = OptionsDataset(torch.tensor(X_train.values, dtype=torch.float32),
                                     torch.tensor(Y_train, dtype=torch.float32))
@@ -120,9 +156,15 @@ class OptionsDataModule(pl.LightningDataModule):
         print(f"Rows -> Train: {len(self.train)} | Validation: {len(self.val)} | Test: {len(self.test)}")
 
     def train_dataloader(self):
-        return DataLoader(self.train, batch_size=self.batch_size, shuffle=True, num_workers=4, persistent_workers=True)
+        return DataLoader(
+            self.train,
+            batch_size=self.batch_size,
+            shuffle=self.train_sampler is None,
+            sampler=self.train_sampler,
+            num_workers=4,
+            persistent_workers=True,
+        )
     def val_dataloader(self):
          return DataLoader(self.val, batch_size=self.batch_size, shuffle=False, num_workers=4, persistent_workers=True)
     def test_dataloader(self):
          return DataLoader(self.test, batch_size=self.batch_size, shuffle=False, num_workers=4, persistent_workers=True)
-
